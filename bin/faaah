@@ -1,0 +1,375 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const fs   = require('fs');
+const path = require('path');
+const os   = require('os');
+const { execSync, spawnSync } = require('child_process');
+
+// ─── ANSI colours (gracefully disabled when not a TTY) ────────────────────
+const isTTY = process.stdout.isTTY;
+const c = {
+  green:  s => isTTY ? `\x1b[32m${s}\x1b[0m` : s,
+  yellow: s => isTTY ? `\x1b[33m${s}\x1b[0m` : s,
+  red:    s => isTTY ? `\x1b[31m${s}\x1b[0m` : s,
+  bold:   s => isTTY ? `\x1b[1m${s}\x1b[0m`  : s,
+  dim:    s => isTTY ? `\x1b[2m${s}\x1b[0m`  : s,
+};
+
+const log   = msg => console.log(`  ${msg}`);
+const ok    = msg => console.log(`  ${c.green('✔')} ${msg}`);
+const warn  = msg => console.log(`  ${c.yellow('!')} ${msg}`);
+const fail  = msg => console.log(`  ${c.red('✖')} ${msg}`);
+const info  = msg => console.log(`  ${c.dim('→')} ${msg}`);
+
+// ─── Paths ─────────────────────────────────────────────────────────────────
+const PKG_ROOT      = path.resolve(__dirname, '..');
+const SHIM_PATH     = path.join(PKG_ROOT, 'bin', 'npm');          // this package's npm shim
+const REAL_NPM_FILE = path.join(PKG_ROOT, '.real-npm-path');      // saved real-npm location
+const SHIM_DIR      = path.join(PKG_ROOT, 'shim');                // dedicated dir we prepend to PATH
+
+// ─── Helpers ───────────────────────────────────────────────────────────────
+
+/** Return the path to the real npm, never our own shim. */
+function findRealNpm() {
+  const shimReal = safeRealpath(SHIM_PATH);
+
+  // 1. Previously saved
+  if (fs.existsSync(REAL_NPM_FILE)) {
+    const saved = fs.readFileSync(REAL_NPM_FILE, 'utf8').trim();
+    if (saved && fs.existsSync(saved) && safeRealpath(saved) !== shimReal) return saved;
+  }
+
+  // 2. Walk PATH
+  const dirs = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of dirs) {
+    const candidate = path.join(dir, 'npm');
+    if (!fs.existsSync(candidate)) continue;
+    if (safeRealpath(candidate) !== shimReal) return candidate;
+  }
+
+  // 3. Known fallbacks
+  for (const f of ['/usr/local/bin/npm', '/usr/bin/npm', '/opt/homebrew/bin/npm']) {
+    if (fs.existsSync(f) && safeRealpath(f) !== shimReal) return f;
+  }
+
+  return null;
+}
+
+function safeRealpath(p) {
+  try { return fs.realpathSync(p); } catch (_) { return p; }
+}
+
+/** Detect which shell config files exist for the current user. */
+function detectShellConfigs() {
+  const home = os.homedir();
+  const candidates = [
+    { file: path.join(home, '.zshrc'),            shell: 'zsh'  },
+    { file: path.join(home, '.bashrc'),           shell: 'bash' },
+    { file: path.join(home, '.bash_profile'),     shell: 'bash' },
+    { file: path.join(home, '.profile'),          shell: 'sh'   },
+    { file: path.join(home, '.config', 'fish', 'config.fish'), shell: 'fish' },
+  ];
+  return candidates.filter(c => fs.existsSync(c.file));
+}
+
+/** The PATH export line we inject, parameterised by shimDir. */
+function pathLine(shimDir, shell) {
+  if (shell === 'fish') {
+    return `fish_add_path --prepend "${shimDir}" # faaah`;
+  }
+  return `export PATH="${shimDir}:$PATH" # faaah`;
+}
+
+/** Return true if a config file already has our injection. */
+function alreadyInjected(file) {
+  try {
+    return fs.readFileSync(file, 'utf8').includes('# faaah');
+  } catch (_) { return false; }
+}
+
+/** Append the PATH line to a shell config file. */
+function injectPathLine(file, line) {
+  const nl = '\n';
+  fs.appendFileSync(file, `${nl}# Added by faaah setup${nl}${line}${nl}`);
+}
+
+// ─── Commands ──────────────────────────────────────────────────────────────
+
+function cmdSetup() {
+  console.log('');
+  console.log(c.bold('  faaah setup'));
+  console.log('');
+
+  const platform = os.platform();
+
+  // ── 1. Find real npm ──────────────────────────────────────────────────
+  const realNpm = findRealNpm();
+  if (!realNpm) {
+    fail('Could not find a real npm binary on your system.');
+    info('Make sure npm is installed before running setup.');
+    process.exit(1);
+  }
+  ok(`Found real npm at: ${c.dim(realNpm)}`);
+  fs.writeFileSync(REAL_NPM_FILE, realNpm, 'utf8');
+
+  // ── 2. Create dedicated shim directory ───────────────────────────────
+  fs.mkdirSync(SHIM_DIR, { recursive: true });
+
+  // ── 3. Place the shim symlink (or copy on Windows) ───────────────────
+  const shimDest = path.join(SHIM_DIR, platform === 'win32' ? 'npm.cmd' : 'npm');
+
+  if (platform === 'win32') {
+    // Windows: write a .cmd wrapper
+    const cmdContent = `@echo off\nnode "${SHIM_PATH}" %*\n`;
+    fs.writeFileSync(shimDest, cmdContent, 'utf8');
+    ok(`Created shim wrapper at: ${c.dim(shimDest)}`);
+  } else {
+    // Unix: symlink shim/npm → bin/npm
+    if (fs.existsSync(shimDest)) fs.unlinkSync(shimDest);
+    fs.symlinkSync(SHIM_PATH, shimDest);
+    fs.chmodSync(SHIM_PATH, 0o755);
+    ok(`Created shim symlink at:  ${c.dim(shimDest)}`);
+  }
+
+  // ── 4. Inject PATH into shell configs ─────────────────────────────────
+  if (platform === 'win32') {
+    setupWindows(SHIM_DIR);
+  } else {
+    setupUnix(SHIM_DIR);
+  }
+
+  // ── 5. Final instructions ─────────────────────────────────────────────
+  console.log('');
+  ok(c.bold('Setup complete!'));
+  console.log('');
+  log('To activate in your current terminal session, run:');
+  console.log('');
+
+  const configs = detectShellConfigs();
+  if (configs.length > 0) {
+    console.log(`    ${c.bold(`source ${configs[0].file}`)}`);
+  } else {
+    console.log(`    ${c.bold(`export PATH="${SHIM_DIR}:$PATH"`)}`);
+  }
+
+  console.log('');
+  log('New terminal windows will work automatically.');
+  log(`Run ${c.bold('faaah verify')} to confirm everything is wired up.`);
+  console.log('');
+}
+
+function setupUnix(shimDir) {
+  const configs = detectShellConfigs();
+
+  if (configs.length === 0) {
+    warn('No shell config files detected (.zshrc, .bashrc, .bash_profile, .profile).');
+    info(`Manually add this line to your shell config:`);
+    info(`  export PATH="${shimDir}:$PATH"`);
+    return;
+  }
+
+  let injected = 0;
+  for (const { file, shell } of configs) {
+    if (alreadyInjected(file)) {
+      ok(`Already configured: ${c.dim(file)}`);
+      continue;
+    }
+    try {
+      injectPathLine(file, pathLine(shimDir, shell));
+      ok(`Updated: ${c.dim(file)}`);
+      injected++;
+    } catch (e) {
+      warn(`Could not write to ${file}: ${e.message}`);
+    }
+  }
+
+  if (injected === 0 && configs.every(c => alreadyInjected(c.file))) {
+    // All already had the line — nothing to do
+  }
+}
+
+function setupWindows(shimDir) {
+  // Add shimDir to the user-level PATH via setx
+  try {
+    const currentPath = execSync('powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable(\'PATH\', \'User\')"', {
+      encoding: 'utf8',
+    }).trim();
+
+    if (currentPath.includes(shimDir)) {
+      ok(`Shim directory already in user PATH.`);
+      return;
+    }
+
+    const newPath = `${shimDir};${currentPath}`;
+    execSync(
+      `powershell -NoProfile -Command "[Environment]::SetEnvironmentVariable('PATH', '${newPath}', 'User')"`,
+      { stdio: 'ignore' }
+    );
+    ok(`Added shim directory to Windows user PATH.`);
+    warn(`Restart your terminal for the change to take effect.`);
+  } catch (e) {
+    warn(`Could not automatically update Windows PATH: ${e.message}`);
+    info(`Manually add this directory to your PATH:`);
+    info(`  ${shimDir}`);
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cmdVerify() {
+  console.log('');
+  console.log(c.bold('  faaah verify'));
+  console.log('');
+
+  let allGood = true;
+
+  // 1. Check real npm is saved
+  if (fs.existsSync(REAL_NPM_FILE)) {
+    const saved = fs.readFileSync(REAL_NPM_FILE, 'utf8').trim();
+    if (fs.existsSync(saved)) {
+      ok(`Real npm path saved: ${c.dim(saved)}`);
+    } else {
+      fail(`Saved npm path no longer exists: ${c.dim(saved)}`);
+      info(`Run ${c.bold('faaah setup')} again.`);
+      allGood = false;
+    }
+  } else {
+    fail('Real npm path not saved.');
+    info(`Run ${c.bold('faaah setup')} to fix this.`);
+    allGood = false;
+  }
+
+  // 2. Check shim dir is on PATH and comes first
+  const shimDir = path.resolve(SHIM_DIR);
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).map(d => path.resolve(d));
+
+  const shimIdx = pathDirs.findIndex(d => d === shimDir);
+  const realNpmDir = fs.existsSync(REAL_NPM_FILE)
+    ? path.dirname(fs.readFileSync(REAL_NPM_FILE, 'utf8').trim())
+    : null;
+  const realIdx = realNpmDir ? pathDirs.findIndex(d => d === path.resolve(realNpmDir)) : -1;
+
+  if (shimIdx === -1) {
+    fail(`Shim directory not found in current PATH.`);
+    info(`You may need to run: source ~/.zshrc  (or your shell config)`);
+    info(`Or open a new terminal window.`);
+    allGood = false;
+  } else if (realIdx !== -1 && shimIdx > realIdx) {
+    fail(`Shim directory is in PATH but comes AFTER the real npm.`);
+    info(`The shim won't intercept npm commands. Run ${c.bold('faaah setup')} again.`);
+    allGood = false;
+  } else {
+    ok(`Shim directory is correctly first in PATH (position ${shimIdx + 1}).`);
+  }
+
+  // 3. Check that `npm` on PATH resolves to our shim
+  try {
+    const whichNpm = execSync('which npm', { encoding: 'utf8' }).trim();
+    const whichReal = safeRealpath(whichNpm);
+    const shimReal  = safeRealpath(SHIM_PATH);
+    if (whichReal === shimReal) {
+      ok(`\`npm\` on PATH resolves to the shim. ✓`);
+    } else {
+      fail(`\`npm\` on PATH resolves to: ${c.dim(whichNpm)}`);
+      info(`Expected it to resolve to the shim. PATH ordering issue.`);
+      allGood = false;
+    }
+  } catch (_) {
+    warn('Could not run `which npm` — skipping resolution check.');
+  }
+
+  // 4. Check sound file
+  const soundFile = path.join(PKG_ROOT, 'sounds', 'done.mp3');
+  if (fs.existsSync(soundFile)) {
+    ok(`Sound file present: ${c.dim(soundFile)}`);
+  } else {
+    fail(`Sound file missing: ${c.dim(soundFile)}`);
+    allGood = false;
+  }
+
+  console.log('');
+  if (allGood) {
+    ok(c.bold('Everything looks good! faaah is active.'));
+  } else {
+    fail(c.bold(`Some checks failed. Run ${c.bold('faaah setup')} to fix them.`));
+    process.exit(1);
+  }
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cmdUninstall() {
+  console.log('');
+  console.log(c.bold('  faaah uninstall'));
+  console.log('');
+
+  const platform = os.platform();
+
+  // 1. Remove PATH injection from shell configs
+  if (platform !== 'win32') {
+    const configs = detectShellConfigs();
+    for (const { file } of configs) {
+      if (!alreadyInjected(file)) continue;
+      try {
+        let content = fs.readFileSync(file, 'utf8');
+        // Remove the block we added (the comment line + the export line)
+        content = content.replace(/\n# Added by faaah setup\n.*# faaah\n/g, '\n');
+        fs.writeFileSync(file, content, 'utf8');
+        ok(`Removed PATH entry from: ${c.dim(file)}`);
+      } catch (e) {
+        warn(`Could not clean ${file}: ${e.message}`);
+      }
+    }
+  }
+
+  // 2. Remove shim directory
+  if (fs.existsSync(SHIM_DIR)) {
+    fs.rmSync(SHIM_DIR, { recursive: true, force: true });
+    ok(`Removed shim directory.`);
+  }
+
+  // 3. Remove saved real-npm path
+  if (fs.existsSync(REAL_NPM_FILE)) {
+    fs.unlinkSync(REAL_NPM_FILE);
+    ok(`Removed saved npm path.`);
+  }
+
+  console.log('');
+  ok(c.bold('faaah has been deactivated.'));
+  log(`Run ${c.bold('npm uninstall -g faaah')} to fully remove the package.`);
+  log('Open a new terminal window to restore normal npm behaviour.');
+  console.log('');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function cmdHelp() {
+  console.log('');
+  console.log(c.bold('  faaah') + c.dim(' — plays a chime after every npm command'));
+  console.log('');
+  console.log('  Commands:');
+  console.log(`    ${c.bold('faaah setup')}      Wire up the shim and configure your shell`);
+  console.log(`    ${c.bold('faaah verify')}     Check that everything is correctly configured`);
+  console.log(`    ${c.bold('faaah uninstall')}  Remove PATH changes made by setup`);
+  console.log(`    ${c.bold('faaah help')}       Show this message`);
+  console.log('');
+}
+
+// ─── Entry point ─────────────────────────────────────────────────────────────
+
+const cmd = process.argv[2] || 'help';
+switch (cmd) {
+  case 'setup':     cmdSetup();     break;
+  case 'verify':    cmdVerify();    break;
+  case 'uninstall': cmdUninstall(); break;
+  case 'help':
+  case '--help':
+  case '-h':        cmdHelp();      break;
+  default:
+    fail(`Unknown command: ${cmd}`);
+    cmdHelp();
+    process.exit(1);
+}

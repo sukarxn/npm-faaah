@@ -1,0 +1,107 @@
+#!/usr/bin/env node
+
+'use strict';
+
+const { spawnSync } = require('child_process');
+const { execSync } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+// ---------------------------------------------------------------------------
+// Resolve the real npm binary (never call ourselves again)
+// ---------------------------------------------------------------------------
+function findRealNpm() {
+  // 1. Check config file written at install time
+  const configPath = path.join(__dirname, '..', '.real-npm-path');
+  if (fs.existsSync(configPath)) {
+    const saved = fs.readFileSync(configPath, 'utf8').trim();
+    if (saved && fs.existsSync(saved)) return saved;
+  }
+
+  // 2. Walk PATH entries and return the first npm that isn't us
+  const thisFile = fs.realpathSync(__filename);
+  const pathDirs = (process.env.PATH || '').split(path.delimiter);
+  for (const dir of pathDirs) {
+    const candidate = path.join(dir, 'npm');
+    if (!fs.existsSync(candidate)) continue;
+    try {
+      const real = fs.realpathSync(candidate);
+      if (real !== thisFile) return candidate;
+    } catch (_) {
+      // symlink resolution failed — skip
+    }
+  }
+
+  // 3. Last resort: well-known locations
+  const fallbacks = [
+    '/usr/local/bin/npm',
+    '/usr/bin/npm',
+    '/opt/homebrew/bin/npm',
+  ];
+  for (const f of fallbacks) {
+    if (fs.existsSync(f)) {
+      try {
+        if (fs.realpathSync(f) !== fs.realpathSync(__filename)) return f;
+      } catch (_) {
+        return f;
+      }
+    }
+  }
+
+  console.error('[faaah] Could not locate the real npm binary. Please file an issue.');
+  process.exit(1);
+}
+
+// ---------------------------------------------------------------------------
+// Play the bundled sound (cross-platform, non-blocking)
+// ---------------------------------------------------------------------------
+function playSound() {
+  const soundFile = path.join(__dirname, '..', 'sounds', 'done.mp3');
+  if (!fs.existsSync(soundFile)) return;
+
+  const platform = os.platform();
+  try {
+    if (platform === 'darwin') {
+      // macOS — built-in afplay
+      spawnSync('afplay', [soundFile], { stdio: 'ignore' });
+    } else if (platform === 'linux') {
+      // Try aplay first (ALSA), then paplay (PulseAudio), then mpg123
+      const players = [
+        ['aplay', ['-q', soundFile]],
+        ['paplay', [soundFile]],
+        ['mpg123', ['-q', soundFile]],
+        ['ffplay', ['-nodisp', '-autoexit', '-loglevel', 'quiet', soundFile]],
+      ];
+      for (const [cmd, args] of players) {
+        const result = spawnSync(cmd, args, { stdio: 'ignore' });
+        if (result.status === 0) break;
+      }
+    } else if (platform === 'win32') {
+      // Windows — PowerShell SoundPlayer
+      const ps = `(New-Object System.Media.SoundPlayer '${soundFile.replace(/'/g, "''")}').PlaySync()`;
+      spawnSync('powershell', ['-NoProfile', '-Command', ps], { stdio: 'ignore' });
+    }
+  } catch (_) {
+    // Sound is best-effort — never crash the user's workflow
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+const realNpm = findRealNpm();
+const args = process.argv.slice(2);
+const subcommand = args[0] || '';
+
+// Run the real npm, inheriting all stdio so output looks identical
+const result = spawnSync(realNpm, args, {
+  stdio: 'inherit',
+  env: process.env,
+  shell: false,
+});
+
+// Play sound after any completed npm command
+playSound();
+
+process.exit(result.status ?? 0);

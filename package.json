@@ -1,0 +1,36 @@
+{
+  "name": "faaah",
+  "version": "1.0.9",
+  "description": "Plays a sound after every npm command completes.",
+  "main": "bin/faaah",
+  "bin": {
+    "faaah": "bin/faaah"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js",
+    "preuninstall": "node scripts/preuninstall.js"
+  },
+  "files": [
+    "bin/",
+    "sounds/",
+    "scripts/",
+    "README.md"
+  ],
+  "keywords": [
+    "npm",
+    "sound",
+    "notification",
+    "faaah",
+    "done",
+    "install"
+  ],
+  "engines": {
+    "node": ">=14.0.0"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "license": "MIT"
+}
